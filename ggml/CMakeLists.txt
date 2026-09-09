@@ -245,6 +245,8 @@ set   (GGML_METAL_TARGET_OS "macos" CACHE STRING
 option(GGML_OPENMP                          "ggml: use OpenMP"                                ON)
 option(GGML_OPENMP_FETCH                    "ggml: fetch LLVM OpenMP"                         OFF)
 option(GGML_RPC                             "ggml: use RPC"                                   OFF)
+option(GGML_RKNPU2                          "ggml: use RKNPU2 (Rockchip RK3588 NPU)"           OFF)
+set   (RKNPU2_SDK_ROOT "" CACHE PATH        "ggml: path to the RKNPU2 runtime/Linux SDK directory")
 option(GGML_SYCL                            "ggml: use SYCL"                                  OFF)
 option(GGML_SYCL_F16                        "ggml: use 16 bit floats for sycl calculations"   OFF)
 option(GGML_SYCL_GRAPH                      "ggml: enable graphs in the SYCL backend"         ON)
@@ -333,6 +335,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-opt.h
     include/ggml-metal.h
     include/ggml-rpc.h
+    include/ggml-rknpu2.h
     include/ggml-virtgpu.h
     include/ggml-sycl.h
     include/ggml-vulkan.h
