@@ -180,8 +180,7 @@ each:
   against the RKLLM stack.
 - F03 additional GGUF conversion coverage: accelerate more source types while
   keeping CPU compatibility.
-- F04 multimodal validation and encoder offload: encoder/projector graphs and
-  end-to-end validation.
+- F04 multimodal validation and encoder offload: one Gemma 4 E2B image pilot and isolated vision SDK-call tracing are verified below. Broader image quality, audio, multi-image inputs, and combined language/vision budget placement remain outstanding.
 - F05 smaller-memory boards: validate budgets and placement on boards with less
   RAM than the reference.
 - F06 persistent packed-weight cache: cut startup conversion time after the
@@ -348,6 +347,63 @@ Final verification after the teardown correction used backend SHA256 `09bf470945
 - All 68 supported operator tests passed again. The AddressSanitizer lifetime test passed with stable descriptor counts of 7 at its post-teardown sampling points.
 
 Final logs use `build/comparison/shared-fixed-confirm.*`, `shared-fixed-quality.*`, `shared-fixed-gemma4.*`, `shared-fixed-zero.*`, `shared-fixed-test.log`, and `shared-lifecycle-asan-fixed.log`. The implementation is retained based on the repeated throughput gain and these correctness checks, with broader quality, energy, and device-memory lifecycle testing still outstanding.
+
+### Gemma 4 E2B image pilot, 2026-09-10
+
+The unchanged backend with SHA256 `09bf47094507b3b6dfbc0b54e412edb5f226100db2b84cf6e40e5f43f2db7a2e` was tested with `llama-mtmd-cli` on the same RK3588 board. The language model is the F16 control above. The matching [Unsloth F16 projector](https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/blob/main/mmproj-F16.gguf) has SHA256 `140be8d7849741f88c50757d529b84373ee8e27052cc2236855b537f4a8215fa`, matching its published hash. The input is `tools/mtmd/test-1.jpeg`, SHA256 `2dff664c0c8aaea18aff8cbe7e868845b775e90cdd7a0bac98df709b131deaa3`. Its 624 x 480 preprocessed image produced 130 image tokens.
+
+The prompt was `Read the largest headline in this image. Answer with only the headline.` All answer runs used four big CPU cores (`taskset -c 4-7`), `-t 4 -tb 4 -c 2048 -b 512 -ub 512 -n 256 --temp 0 --seed 1234 --jinja -fa off -ngl 999 -v --no-warmup`. These are single fresh-process observations, not repeated throughput measurements. Initial 32-token runs stopped inside reasoning text and do not count as complete-answer quality checks.
+
+With non-mmap loading, the budget-zero CPU run and both default-budget runs (CPU vision or explicit `--mmproj-device RKNPU2`) returned byte-identical generated text, ending with `MEN WALK ON MOON`. The CPU process took 68.92 seconds with 6,543,164 KiB peak RSS; CPU vision with NPU-enabled language-model placement took 88.82 seconds with 8,660,796 KiB; enabling the projector backend too took 90.38 seconds with 8,662,128 KiB. Image encoding took 6.600, 6.590, and 6.641 seconds respectively. Decode was approximately 4.1 tokens/s in all three cases. This short workload did not benefit from the NPU-enabled configuration.
+
+Separate one-generated-token diagnostics used a temporary `LD_PRELOAD` wrapper around `rknn_matmul_run` and `GGML_SCHED_DEBUG=2`. Both the budget-zero control and the non-mmap default-budget language-plus-vision run made zero SDK matmul calls. Thus the non-mmap image pilot establishes CPU fallback compatibility, not NPU numerical accuracy. Provisional scheduler splits and `CLIP using RKNPU2` alone are not evidence of executed NPU work.
+
+For isolated vision, mmap excludes language-model weights from NPU admission while `--mmproj-device RKNPU2` gives the projector its own backend host buffer. This diagnostic made 339 successful SDK matmul calls, all during image encoding, and the vision graph had 227 splits. The language-model graph had one CPU split. Traced timings are not used as performance measurements.
+
+The uninstrumented mmap pair also returned the correct final headline. Unlike the all-fallback pair, its reasoning text differed, so it is not token-by-token equivalent. Both processes exited zero:
+
+| Measurement | CPU, zero budget | NPU vision, CPU language model |
+| --- | --- | --- |
+| Cold image encoding | 6.627 s | 6.578 s |
+| Image embedding evaluation in language model | 6.715 s | 6.753 s |
+| Complete process | 65.97 s | 72.67 s |
+| Peak RSS | 5,718,072 KiB | 6,094,268 KiB |
+| Autoregressive eval calls | 182 | 209 |
+
+The total times include different generated lengths and must not be interpreted as a throughput regression. Cold image encoding includes graph preparation and first-use admission; the 0.049-second difference from one pair does not establish a speedup. Repeated warm encoder measurements and numerical embedding comparisons are recorded below. These results are retained as `mm-validated-0-cpu-mmap.*` and `mm-validated-0-vision-mmap.*`.
+
+Reproduce the isolated-vision pair with the verified files, substituting local paths:
+
+```sh
+ulimit -n 65536
+GGML_RKNPU2_BUDGET=0 taskset -c 4-7 ./build/bin/llama-mtmd-cli -m /path/gemma-4-E2B-it-F16-control.gguf --mmproj /path/gemma-4-E2B-it-mmproj-F16.gguf --image tools/mtmd/test-1.jpeg -p 'Read the largest headline in this image. Answer with only the headline.' --load-mode mmap --no-warmup -t 4 -tb 4 -c 2048 -b 512 -ub 512 -n 256 --temp 0 --seed 1234 --jinja -fa off -ngl 999 -v --device none --no-mmproj-offload
+taskset -c 4-7 ./build/bin/llama-mtmd-cli -m /path/gemma-4-E2B-it-F16-control.gguf --mmproj /path/gemma-4-E2B-it-mmproj-F16.gguf --image tools/mtmd/test-1.jpeg -p 'Read the largest headline in this image. Answer with only the headline.' --load-mode mmap --no-warmup -t 4 -tb 4 -c 2048 -b 512 -ub 512 -n 256 --temp 0 --seed 1234 --jinja -fa off -ngl 999 -v --device none --mmproj-device RKNPU2
+```
+
+Control pitfalls: `--device none` does not exclude ACCEL buffer types from the language-model CPU buffer candidate list. An `-ot '.*=CPU'` override also considers those candidates and did not isolate CPU weights. Use `GGML_RKNPU2_BUDGET=0` for a no-NPU control. Keep the failed-control logs, but do not label their timings CPU-only. The follow-up below identifies budget exhaustion in the combined configuration.
+
+Board artifacts are in `build/comparison/`: `mm-validated-0-cpu.*`, `mm-answer-hybrid.*`, `mm-answer-npu.*`, `mm-validated-1-cpu.*`, `mm-validated-1-npu.*`, and `mm-validated-1-vision-mmap.*`. Commands are retained in `rknpu-mm-validated.sh`, and each resource JSON records its command, exit status, wall time, and peak RSS. All listed completed runs exited zero. The earlier `mm-image-*`, `mm-answer-cpu.*`, and `mm-validated-1-vision.*` records contain the short-generation or failed-isolation controls described above.
+
+This is one OCR-style image smoke test, not a multimodal accuracy benchmark. Audio, video, multiple images, broader embedding/logit error comparisons, and energy remain unverified. No backend or multimodal implementation changes were made for this pilot.
+
+### Combined admission diagnosis and warm vision follow-up, 2026-09-10
+
+A read-only GDB run of the combined non-mmap configuration stopped at `mtmd_batch_encode`. The shared context contained a 2,147,483,648-byte budget, 2,050,228,224 bytes of persistent weights (1,955.25 MiB), and 97,255,424 bytes of cached scratch (92.75 MiB): exactly zero bytes remained. After image encoding started, the first execution-context request observed was M=130, K=1536, partition N=688, core 0, with the same full counters. The existing admission checks therefore cannot allocate scratch for the actual image-embedding evaluation shape or admit new vision weights. Packed weights and planning-shape scratch remain resident until teardown; this is allocation starvation, not an unsupported vision matmul kernel. `mm-budget-gdb.log` and `rknpu-mm-budget.{gdb,sh}` retain the diagnostic; its timing is not a benchmark.
+
+An isolated encoder probe loaded the same model with mmap but did not create a language-model execution context. It selected CPU vision first, then NPU vision, and encoded the same preprocessed image six times per context. The first call is cold; the following five calls are the warm sample. No SDK tracing or debugger was active during this measurement. Both modes used four big cores, four threads, and disabled flash attention.
+
+| Encoder | Cold call | Five warm calls, mean +/- sample standard deviation |
+| --- | --- | --- |
+| CPU | 6.591 s | 6.605 +/- 0.008 s |
+| NPU with CPU fallback | 6.703 s | 3.412 +/- 0.003 s |
+
+The measured warm encoder speedup is 1.94x for this one image. This does not include language-model prefill/decode, image preprocessing, model loading, or end-to-end request latency. The two backend groups ran sequentially in one process, so broader workload and order-reversed measurements remain useful before generalizing the result.
+
+All 199,680 output embedding values were finite. All six outputs were exactly repeatable within each backend. Comparing CPU and NPU yielded RMSE 0.007520776, relative L2 error 0.009872480, cosine similarity 0.999951270, and maximum absolute error 0.161024809. These are measured errors, not an established model-quality acceptance threshold; the earlier complete-answer comparison passed for this image but does not replace broader evaluation.
+
+The temporary probe and successful results are `build/comparison/rknpu-mm-warm.cpp` and `mm-warm-fixed.{stdout,stderr}`. It uses the existing `mtmd_encode_chunk` API and excludes marker text chunks from encoding. Initial probe attempts incorrectly assumed a single tokenizer chunk and then used vocabulary-only loading, which supplied no embedding dimensions; those attempts are not numerical evidence. The corrected probe requires a nonempty embedding and exited zero.
+
+Next: design admission headroom for actual execution shapes while preserving the placement-time CPU fallback guarantee and previously admitted reservations. Combined language/vision weight prioritization also needs an explicit policy. Increasing the overall budget alone does not address the greedy-admission failure mode. No production behavior was changed in this investigation.
 
 ## Hardware validation runbook (Gemma text)
 
